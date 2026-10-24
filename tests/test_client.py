@@ -63,3 +63,25 @@ def test_dead_server_does_not_silently_retry(tmp_path):
     client = Client(descriptor(tmp_path))
     with pytest.raises(RuntimeError, match="outcome may be unknown"):
         client.call("execute", timeout=0.1)
+
+
+def test_stale_descriptor_from_a_crash_is_ignored_and_removed(tmp_path, monkeypatch):
+    import socket
+
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.delenv("BLENDER_COMPACT_CONNECTION", raising=False)
+    folder = tmp_path / "blender-compact-mcp"
+    folder.mkdir()
+    dead = socket.socket()
+    dead.bind(("127.0.0.1", 0))
+    dead_port = dead.getsockname()[1]
+    dead.close()
+    with socket.socket() as live:
+        live.bind(("127.0.0.1", 0))
+        live.listen(1)
+        base = {"protocol": 1, "host": "127.0.0.1", "output_dir": "x", "token": "t"}
+        (folder / "connection-1.json").write_text(json.dumps({**base, "port": dead_port}))
+        (folder / "connection-2.json").write_text(json.dumps({**base, "port": live.getsockname()[1]}))
+        client = Client()
+    assert client.info["port"] != dead_port
+    assert [p.name for p in folder.glob("connection-*.json")] == ["connection-2.json"]

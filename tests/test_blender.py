@@ -302,3 +302,205 @@ def test_demo_render_and_save(blender):
     shutil.copy2(path, ROOT / "artifacts/demo.png")
     shutil.copy2(out / "demo.blend", ROOT / "artifacts/demo.blend")
     (ROOT / "artifacts/demo-steps.json").write_text(json.dumps(steps, indent=2))
+
+
+def test_old_previews_are_pruned(blender):
+    code = (
+        "import tempfile, os\n"
+        "from pathlib import Path\n"
+        "from compact_blender.engine import prune_previews, KEEP_PREVIEWS\n"
+        "with tempfile.TemporaryDirectory() as d:\n"
+        "    for i in range(KEEP_PREVIEWS + 5):\n"
+        "        p = Path(d, f'preview-{i:032x}.png'); p.write_bytes(b'x'); os.utime(p, (i, i))\n"
+        "    Path(d, 'preview-mine.png').write_bytes(b'x')\n"
+        "    prune_previews(d)\n"
+        "    names = sorted(p.name for p in Path(d).iterdir())\n"
+        "result = [len(names), 'preview-mine.png' in names, f'preview-{0:032x}.png' in names]\n"
+    )
+    value = blender.call("execute", {"steps": [{"op": "python", "code": code}]})["results"][0]["result"][
+        "value"
+    ]
+    assert value == [21, True, False]
+
+
+def test_delete_removes_the_data_it_leaves_behind(blender):
+    def mesh_names():
+        code = "result = sorted(m.name for m in bpy.data.meshes) + sorted(m.name for m in bpy.data.materials)"
+        return blender.call("execute", {"steps": [{"op": "python", "code": code}]})["results"][0]["result"][
+            "value"
+        ]
+
+    before = mesh_names()
+    blender.call(
+        "execute",
+        {
+            "steps": [
+                {"op": "primitive", "kind": "cube", "name": "Orphaned"},
+                {"op": "material", "name": "OrphanedMat", "color": [1, 0, 0, 1]},
+                {"op": "assign_material", "name": "Orphaned", "material": "OrphanedMat"},
+            ]
+        },
+    )
+    assert mesh_names() != before
+    blender.call("execute", {"steps": [{"op": "delete", "names": ["Orphaned"], "confirm": True}]})
+    assert mesh_names() == before
+
+
+def build_scene(blender, prefix):
+    blender.call(
+        "execute",
+        {
+            "steps": [
+                {"op": "primitive", "kind": "cube", "name": f"{prefix}Cube", "scale": [1, 2, 3]},
+                {"op": "camera", "name": f"{prefix}Cam", "location": [8, -8, 6], "target": [0, 0, 0]},
+                {"op": "light", "name": f"{prefix}Sun", "location": [4, 4, 8], "energy": 3, "kind": "SUN"},
+            ]
+        },
+    )
+
+
+def exported(blender, **step):
+    result = blender.call("execute", {"steps": [{"op": "export", **step}]})
+    return result["results"][0]["result"]
+
+
+def test_export_writes_engine_ready_files_and_reports_checks(blender):
+    build_scene(blender, "Ex")
+    folder = Path(blender.info["output_dir"])
+    godot = exported(blender, engine="godot", filename="ex.glb", names=["ExCube"])
+    assert godot["file"] == "ex.glb" and godot["triangles"] == 12 and godot["objects"] == 1
+    assert (folder / "ex.glb").read_bytes()[:4] == b"glTF"
+    unity = exported(blender, engine="unity", filename="ex-unity.fbx", names=["ExCube"])
+    assert unity["objects"] == 1 and (folder / "ex-unity.fbx").read_bytes().startswith(b"Kaydara FBX Binary")
+    unreal = exported(blender, engine="unreal", filename="ex-unreal.fbx", names=["ExCube"])
+    assert unreal["triangles"] == 12 and (folder / "ex-unreal.fbx").stat().st_size > 0
+
+
+def test_export_refuses_wrong_extension_unknown_engine_and_overwrite(blender):
+    def run(**step):
+        return blender.call("execute", {"steps": [{"op": "export", "names": ["Ex2Cube"], **step}]})
+
+    build_scene(blender, "Ex2")
+    with pytest.raises(RuntimeError, match="engine must be one of"):
+        run(engine="blender", filename="a.glb")
+    assert "must end in .glb" in run(engine="godot", filename="a.fbx")["error"]
+    assert run(engine="godot", filename="once.glb")["ok"]
+    assert "overwrite" in run(engine="godot", filename="once.glb")["error"]
+
+
+def test_export_copies_to_the_send_folder_without_overwriting(blender, tmp_path):
+    build_scene(blender, "Ex3")
+    code = (
+        "import tempfile\n"
+        "from pathlib import Path\n"
+        "from compact_blender.engine import Engine\n"
+        "send, out = Path(params['send']), Path(params['out'])\n"
+        "engine = Engine(out, ('save',), send_dir=send)\n"
+        "step = {'op': 'export', 'engine': 'godot', 'filename': 'sent.glb', 'names': ['Ex3Cube']}\n"
+        "first = engine.step(step)['result']['sent']\n"
+        "step['filename'] = 'sent2.glb'\n"
+        "(send / 'sent2.glb').write_bytes(b'mine')\n"
+        "try:\n"
+        "    engine.step(step)\n"
+        "    refused = False\n"
+        "except ValueError:\n"
+        "    refused = True\n"
+        "result = [first, (send / 'sent.glb').is_file(), refused, (send / 'sent2.glb').read_bytes() == b'mine']\n"
+    )
+    params = {"send": str(tmp_path / "game"), "out": str(tmp_path / "out")}
+    (tmp_path / "game").mkdir()
+    value = blender.call("execute", {"steps": [{"op": "python", "code": code, "params": params}]})["results"][
+        0
+    ]["result"]["value"]
+    assert value == [True, True, True, True]
+
+
+def test_capture_sheet_is_one_image_with_four_tiles(blender):
+    build_scene(blender, "Sh")
+    result = blender.call("capture", {"filename": "sheet-test.png", "size": 128, "view": "sheet"})
+    from struct import unpack
+
+    data = (Path(blender.info["output_dir"]) / result["file"]).read_bytes()
+    width, height = unpack(">II", data[16:24])
+    assert (width, height) == (result["width"], result["height"]) and width == 2 * (width // 2)
+    assert (
+        result["width"] >= 2 * 100
+    )  # two 128-pixel-long tiles across, scene aspect keeps the long edge at 128
+
+
+def python_value(blender, code):
+    return blender.call("execute", {"steps": [{"op": "python", "code": code}]})["results"][0]["result"][
+        "value"
+    ]
+
+
+def test_parent_keeps_world_position_and_can_be_cleared(blender):
+    blender.call(
+        "execute",
+        {
+            "steps": [
+                {"op": "primitive", "kind": "cube", "name": "Par", "location": [5, 0, 0]},
+                {"op": "primitive", "kind": "cube", "name": "Kid", "location": [0, 7, 0]},
+                {"op": "parent", "name": "Kid", "parent": "Par"},
+            ]
+        },
+    )
+    code = "result = [bpy.data.objects['Kid'].parent.name, list(bpy.data.objects['Kid'].matrix_world.translation)]"
+    assert python_value(blender, code) == ["Par", [0, 7, 0]]
+    blender.call("execute", {"steps": [{"op": "parent", "name": "Kid"}]})
+    code = "result = [bpy.data.objects['Kid'].parent, list(bpy.data.objects['Kid'].matrix_world.translation)]"
+    assert python_value(blender, code) == [None, [0, 7, 0]]
+
+
+def test_collection_moves_objects_and_refuses_foreign_collections(blender):
+    blender.call(
+        "execute",
+        {
+            "steps": [
+                {"op": "primitive", "kind": "cube", "name": "InGroup"},
+                {"op": "collection", "name": "Props", "objects": ["InGroup"]},
+            ]
+        },
+    )
+    code = "result = [c.name for c in bpy.data.objects['InGroup'].users_collection]"
+    assert python_value(blender, code) == ["Props"]
+    python_value(blender, "bpy.data.collections.new('Mine'); result = 1")
+    refused = blender.call(
+        "execute", {"steps": [{"op": "collection", "name": "Mine", "objects": ["InGroup"]}]}
+    )
+    assert refused["ok"] is False and "not made by this add-on" in refused["error"]
+
+
+def test_world_and_lighting(blender):
+    blender.call(
+        "execute",
+        {
+            "steps": [
+                {"op": "world", "color": [0.1, 0.2, 0.3], "strength": 0.5},
+                {"op": "lighting", "prefix": "Rig", "target": [0, 0, 1], "distance": 9, "energy": 500},
+            ]
+        },
+    )
+    code = (
+        "node = next(n for n in bpy.context.scene.world.node_tree.nodes if n.type == 'BACKGROUND')\n"
+        "rig = sorted(o.name for o in bpy.data.objects if o.name.startswith('Rig_'))\n"
+        "result = [round(node.inputs['Strength'].default_value, 2), rig, bpy.data.objects['Rig_fill'].data.energy]"
+    )
+    assert python_value(blender, code) == [0.5, ["Rig_fill", "Rig_key", "Rig_rim"], 200.0]
+    again = blender.call("execute", {"steps": [{"op": "lighting", "prefix": "Rig"}]})
+    assert again["ok"] is False and "already exists" in again["error"]
+
+
+def test_sprite_sheet_renders_frames_into_one_grid(blender):
+    from struct import unpack
+
+    build_scene(blender, "Sp")
+    blender.call("execute", {"steps": [{"op": "frame", "start": 1, "end": 10}]})
+    result = blender.call(
+        "execute",
+        {"steps": [{"op": "sprite_sheet", "filename": "sprites.png", "frames": 6, "columns": 3, "size": 64}]},
+    )["results"][0]["result"]
+    assert result["frames"] == [1, 3, 5, 6, 8, 10]
+    data = (Path(blender.info["output_dir"]) / "sprites.png").read_bytes()
+    assert unpack(">II", data[16:24]) == (result["width"], result["height"])
+    assert result["width"] == 3 * (result["width"] // 3) and result["height"] == 2 * (result["height"] // 2)

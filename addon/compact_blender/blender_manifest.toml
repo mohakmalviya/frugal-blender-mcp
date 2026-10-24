@@ -1,0 +1,13 @@
+schema_version = "1.0.0"
+id = "compact_blender"
+version = "0.2.0"
+name = "Frugal Blender MCP"
+tagline = "Let AI agents build scenes through four compact MCP tools"
+maintainer = "Mohak Malviya"
+type = "add-on"
+blender_version_min = "4.2.0"
+license = ["SPDX:MIT"]
+
+[permissions]
+files = "Writes exports and previews to a folder you choose"
+network = "Listens on a loopback port for the local MCP server"

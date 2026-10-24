@@ -45,6 +45,17 @@ def write_zip(target):
     return target
 
 
+def write_extension_zip(target):
+    """The same add-on as a Blender 4.2+ extension: the manifest sits at the root of the ZIP."""
+    target = Path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    source = addon_source()
+    with ZipFile(target, "w", ZIP_DEFLATED) as archive:
+        for path in [*sorted(source.glob("*.py")), source / "blender_manifest.toml"]:
+            archive.write(path, path.name)
+    return target
+
+
 def install(version=None, root=None):
     """Copy the add-on into a Blender user scripts folder. Returns the destination."""
     versions = blender_versions(root)

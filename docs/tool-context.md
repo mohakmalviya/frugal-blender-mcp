@@ -4,15 +4,15 @@ Every MCP client sends the server's tool definitions (and any server instruction
 before the first prompt, and again on every request after that. That cost is paid even when the
 agent never touches Blender. This benchmark measures it.
 
-Measured on 2026-10-13, Windows 11, tokenized with tiktoken. Raw output: [tool-context.json](tool-context.json).
+Competitors measured on 2026-10-13, Frugal Blender MCP re-measured on 2026-10-25, Windows 11, same script, tokenized with tiktoken. Raw output: [tool-context.json](tool-context.json).
 
 | Server | Tools | Definition tokens | Instruction tokens | Total (o200k) | vs. this repo |
 |---|---:|---:|---:|---:|---:|
-| **Frugal Blender MCP** (this repo, 0.2.0) | **4** | 289 | 49 | **338** | 1x |
-| [Blender Lab official](https://projects.blender.org/lab/blender_mcp) blender-mcp 1.0.1 | 26 | 3,487 | 1,235 | 4,722 | 14.0x |
-| [ahujasid mcp-for-blender](https://github.com/ahujasid/mcp-for-blender) 2.0.0 | 31 | 7,111 | 353 | 7,464 | 22.1x |
+| **Frugal Blender MCP** (this repo) | **4** | 261 | 36 | **297** | 1x |
+| [Blender Lab official](https://projects.blender.org/lab/blender_mcp) blender-mcp 1.0.1 | 26 | 3,487 | 1,235 | 4,722 | 15.9x |
+| [ahujasid mcp-for-blender](https://github.com/ahujasid/mcp-for-blender) 2.0.0 | 31 | 7,111 | 353 | 7,464 | 25.1x |
 
-`cl100k_base` gives nearly identical numbers (330 / 4,651 / 7,393).
+`cl100k_base` gives nearly identical numbers (289 / 4,651 / 7,393).
 
 ## What our design costs later
 
@@ -21,10 +21,10 @@ when it needs them, and those results enter the conversation too. Counting them:
 
 | Discovery | Extra tokens | Running total | vs. official | vs. ahujasid |
 |---|---:|---:|---:|---:|
-| None (tool list only) | 0 | 338 | 14.0x less | 22.1x less |
-| Operation summaries (`discover()`) | 189 | 527 | 9.0x less | 14.2x less |
-| Summaries plus a typical scene's six schemas: primitive, material, assign_material, array, light, camera | 464 | 802 | 5.9x less | 9.3x less |
-| Worst case: summaries plus every operation schema | 918 | 1,256 | 3.8x less | 5.9x less |
+| None (tool list only) | 0 | 297 | 15.9x less | 25.1x less |
+| Operation summaries (`discover()`) | 288 | 585 | 8.1x less | 12.8x less |
+| Summaries plus a typical scene's six schemas: primitive, material, assign_material, array, light, camera | 563 | 860 | 5.5x less | 8.7x less |
+| Worst case: summaries plus every operation schema (22 operations) | 1,384 | 1,681 | 2.8x less | 4.4x less |
 
 ## How the definitions stay small
 

@@ -16,6 +16,19 @@ def state_dir():
     return Path(base) / "blender-compact-mcp"
 
 
+def stale(path):
+    """True only when nothing listens on the descriptor's port, e.g. after a Blender crash."""
+    try:
+        port = json.loads(path.read_text(encoding="utf-8"))["port"]
+        # Windows retries a refused loopback connect for about 2 seconds.
+        socket.create_connection(("127.0.0.1", port), timeout=3).close()
+    except ConnectionRefusedError:
+        return True
+    except (OSError, ValueError, KeyError):
+        pass
+    return False
+
+
 class Client:
     def __init__(self, descriptor=None):
         explicit = descriptor or os.environ.get("BLENDER_COMPACT_CONNECTION")
@@ -23,6 +36,17 @@ class Client:
             path = Path(explicit)
         else:
             paths = sorted(state_dir().glob("connection-*.json"))
+            wanted = os.environ.get("FRUGAL_HEADLESS")
+            if not paths and wanted:
+                # Opt-in: with FRUGAL_HEADLESS=1 (or a permission list) the server starts its own Blender.
+                from . import headless
+
+                headless.ensure(state_dir(), wanted)
+                paths = sorted(state_dir().glob("connection-*.json"))
+            if len(paths) > 1:
+                for path in [p for p in paths if stale(p)]:
+                    path.unlink(missing_ok=True)
+                    paths.remove(path)
             if len(paths) != 1:
                 raise RuntimeError(
                     "Start the Blender bridge. For multiple/stale instances, set BLENDER_COMPACT_CONNECTION."

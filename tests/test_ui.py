@@ -48,6 +48,32 @@ def test_real_timer_and_undo(tmp_path):
             connection = tmp_path / "connection.json"
             wait_for(connection)
             client = Client(connection)
+
+            def execute(*steps):
+                return client.call("execute", {"steps": list(steps)})
+
+            def cube(name):
+                return {"op": "primitive", "name": name, "kind": "cube"}
+
+            def count(name):
+                return client.call("inspect", {"names": [name]})["total"]
+
+            # A failed batch is rolled back, including the steps that worked.
+            failed = execute(cube("Ghost"), {"op": "transform", "name": "Missing", "location": [0, 0, 0]})
+            assert failed["ok"] is False and failed["rolled_back"] is True
+            assert count("Ghost") == 0
+            # Delete is held until the user decides, and cleans up the mesh it leaves behind.
+            assert execute(cube("Doomed"))["ok"]
+            deleted = execute({"op": "delete", "names": ["Doomed"], "confirm": True})
+            assert deleted["ok"], deleted
+            assert count("Doomed") == 0
+            (tmp_path / "deny").touch()
+            assert execute(cube("Spared"))["ok"]
+            with pytest.raises(RuntimeError, match="Denied"):
+                execute({"op": "delete", "names": ["Spared"], "confirm": True})
+            (tmp_path / "deny").unlink()
+            assert count("Spared") == 1
+            assert execute(cube("Doomed2"))["ok"]
             assert client.call(
                 "execute",
                 {"steps": [{"op": "primitive", "name": "UITest", "kind": "cube", "location": [1, 2, 3]}]},
@@ -59,6 +85,9 @@ def test_real_timer_and_undo(tmp_path):
             wait_for(tmp_path / "ui-result.json")
             result = json.loads((tmp_path / "ui-result.json").read_text())
             assert result == {
+                "selected": ["UITest"],
+                "log": ["primitive", "transform"],
+                "running": False,
                 "poll": True,
                 "location": [1, 2, 3],
                 "timer_removed": True,

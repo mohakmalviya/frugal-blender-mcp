@@ -64,12 +64,32 @@ CATALOG = {
         },
     },
     "delete": {
-        "summary": "Delete managed objects only; requires delete permission AND confirm",
-        "args": {"names": "list of up to 200 managed names", "confirm": "true"},
+        "summary": "Delete managed objects and their unused data; requires delete permission AND confirm",
+        "args": {
+            "names": "list of up to 200 managed names",
+            "confirm": "true; may wait for approval in Blender",
+        },
+    },
+    "sprite_sheet": {
+        "summary": "Render evenly spaced animation frames into one PNG grid for 2D sprites; blocking",
+        "args": {
+            "filename": "basename ending .png",
+            "frames": "1..64, default 8, spread over the frame range",
+            "columns": "1..64, default 8",
+            "size": "32..512 longest edge per frame, default 128",
+        },
+    },
+    "export": {
+        "summary": "Export objects for godot, unity or unreal with the right axes and scale, and report game-ready checks",
+        "args": {
+            "engine": "godot (.glb) | unity (.fbx, Y-up) | unreal (.fbx, Z-up)",
+            "filename": "basename ending .glb for godot, .fbx for unity and unreal; existing files refused",
+            "names": "optional list of object names, default all managed objects",
+        },
     },
     "save": {
         "summary": "Save a copy under the configured output directory; existing files refused",
-        "args": {"filename": "basename ending .blend"},
+        "args": {"filename": "basename ending .blend; may wait for approval in Blender"},
     },
 }
 
@@ -81,7 +101,7 @@ for entry in CATALOG.values():
 PERMISSIONS = {
     name: ("delete" if name == "delete" else "save" if name == "save" else "write") for name in CATALOG
 }
-PERMISSIONS.update(python="python", render="render", rna=None)
+PERMISSIONS.update(python="python", render="render", rna=None, export="save", sprite_sheet="render")
 
 
 def discover(operation=None):

@@ -15,6 +15,7 @@ from pathlib import Path
 
 MAX_REQUEST = 262144
 MAX_CLIENTS = 8
+APPROVAL_TIMEOUT = 120  # shorter than the client's default 180 s, so a denial reaches it in time
 
 
 def state_dir():
@@ -30,9 +31,34 @@ def encode(value):
     return (json.dumps(value, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
 
 
+class Pending:
+    """A request held until the user approves or denies it in Blender."""
+
+    def __init__(self, request_id, digest, method, params, summary):
+        self.request_id, self.digest, self.method, self.params, self.summary = (
+            request_id,
+            digest,
+            method,
+            params,
+            summary,
+        )
+        self.since = time.monotonic()
+        self.allowed = None
+
+
+class Job:
+    """A batch that runs one step per timer tick, so the user can watch it."""
+
+    def __init__(self, request_id, digest, run):
+        self.request_id, self.digest, self.run = request_id, digest, run
+
+
 class Server:
     def __init__(self, engine, descriptor=None):
         self.engine = engine
+        self.paused = False
+        self.pending = []
+        self.notify = None  # called when the list of pending approvals changes
         self.token = secrets.token_urlsafe(32)
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.socket.bind(("127.0.0.1", 0))
@@ -74,17 +100,89 @@ class Server:
             if previous_digest != digest:
                 return {"ok": False, "error": "Request id reused with different parameters"}
             return result
+        method = request.get("method")
+        if self.paused:
+            return {"ok": False, "error": "Paused by the user in Blender. Nothing ran; try again later."}
+        if any(p.request_id == request_id for p in self.pending):
+            return {"ok": False, "error": "Request is already waiting for approval"}
+        summary = self.engine.needs_approval(method, params)
+        if summary:
+            held = Pending(request_id, digest, method, params, summary)
+            self.pending.append(held)
+            self.changed()
+            return held
+        return self.finish(request_id, digest, method, params)
+
+    def finish(self, request_id, digest, method, params):
         try:
-            result = {"ok": True, "result": self.engine.dispatch(request.get("method"), params)}
+            value = self.engine.dispatch(method, params)
+            if hasattr(value, "advance"):
+                return Job(request_id, digest, value)
+            result = {"ok": True, "result": value}
         except Exception as exc:
             result = {"ok": False, "error": str(exc), "type": type(exc).__name__}
+        return self.remember(request_id, digest, result)
+
+    def remember(self, request_id, digest, result):
         self.cache[request_id] = (digest, result)
         if len(self.cache) > 128:
             self.cache.popitem(last=False)
         return result
 
+    def step(self, job):
+        """Run the next step of a visible batch. Returns the reply once it is over, else None."""
+        try:
+            value = job.run.advance()
+        except Exception as exc:
+            return self.remember(
+                job.request_id, job.digest, {"ok": False, "error": str(exc), "type": type(exc).__name__}
+            )
+        if value is None:
+            return None
+        return self.remember(job.request_id, job.digest, {"ok": True, "result": value})
+
+    def accept(self, state, reply):
+        if isinstance(reply, Pending):
+            state["held"] = reply
+        elif isinstance(reply, Job):
+            state["job"] = reply
+            self.changed()
+        else:
+            state["output"] = encode(reply)
+
+    def changed(self):
+        if self.notify:
+            self.notify()
+
+    def decide(self, allowed):
+        """Approve or deny the oldest waiting request. Returns False when none is waiting."""
+        for held in self.pending:
+            if held.allowed is None:
+                held.allowed = bool(allowed)
+                return True
+        return False
+
+    def resolve(self, held):
+        """The reply for a held request once it is decided or has timed out, else None."""
+        if held.allowed is None and time.monotonic() - held.since > APPROVAL_TIMEOUT:
+            held.allowed = False
+        if held.allowed is None:
+            return None
+        self.pending.remove(held)
+        self.changed()
+        if not held.allowed:
+            return {"ok": False, "error": "Denied in Blender, or not approved in time", "type": "Denied"}
+        return self.finish(held.request_id, held.digest, held.method, held.params)
+
     def drop(self, conn):
-        self.clients.pop(conn, None)
+        state = self.clients.pop(conn, None)
+        if state and state.get("job"):
+            # Nobody is waiting for the rest of the batch. What already ran stays; the interface unlocks.
+            state["job"].run.engine.running = None
+        if state and state.get("held") in self.pending:
+            # The client is gone, so there is nobody to answer. Nothing has run.
+            self.pending.remove(state["held"])
+            self.changed()
         conn.close()
 
     def poll(self):
@@ -104,7 +202,21 @@ class Server:
         executed = False
         for conn, state in list(self.clients.items()):
             try:
-                if state["output"] is None:
+                held, job = state.get("held"), state.get("job")
+                if held:
+                    reply = None if executed else self.resolve(held)
+                    if reply is not None:
+                        state.update(held=None, since=time.monotonic())
+                        self.accept(state, reply)
+                        executed = True
+                elif job:
+                    reply = None if executed else self.step(job)
+                    executed = True
+                    if reply is not None:
+                        state.update(job=None, since=time.monotonic())
+                        self.accept(state, reply)
+                        self.changed()
+                elif state["output"] is None:
                     if time.monotonic() - state["since"] > 10:
                         self.drop(conn)
                         continue
@@ -125,7 +237,7 @@ class Server:
                                 state["input"].split(b"\n", 1)[0],
                                 parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
                             )
-                            state["output"] = encode(self.handle(request))
+                            self.accept(state, self.handle(request))
                         except (ValueError, TypeError, UnicodeError):
                             state["output"] = encode({"ok": False, "error": "Invalid JSON request"})
                         state["since"] = time.monotonic()
@@ -140,6 +252,8 @@ class Server:
                         self.drop(conn)
             except OSError:
                 self.drop(conn)
+        if any(state.get("job") for state in self.clients.values()):
+            return max(getattr(self.engine, "pace", 0), 0.02)
         return 0.02 if self.clients else 0.1
 
     def close(self):
