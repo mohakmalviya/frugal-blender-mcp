@@ -7,6 +7,7 @@ Blender main thread. It is not covered by the narrower write/save/delete toggles
 import contextlib
 import io
 import json
+import os
 
 import bpy
 
@@ -15,9 +16,11 @@ OPERATIONS = {
     "python": {
         "summary": "Full bpy/Python API: nodes, rigs, simulation, files, operators; unrestricted local code",
         "args": {
-            "code": "Python source; bpy, params, output_dir provided; assign result for JSON return",
+            "code": "Python source; bpy, params, output_dir provided; assign result for JSON return; may wait for approval in Blender",
+            "file": "absolute path of a .py file to run instead of code",
             "params": "optional JSON object",
-            "max_output": "0..32000 characters, default 2000",
+            "max_output": "0..32000 characters, default 2000; printed output is returned only when result is unset or the step fails",
+            "note": "variables persist between calls until the bridge stops; keep names, not Blender objects",
         },
     },
     "modifier": {
@@ -60,6 +63,28 @@ OPERATIONS = {
             "limit": "1..100, default 20",
         },
     },
+    "parent": {
+        "summary": "Parent an object to another, keeping where it is, or clear its parent",
+        "args": {"name": "child object name", "parent": "parent object name; omit to clear"},
+    },
+    "collection": {
+        "summary": "Create a collection and move objects into it",
+        "args": {"name": "collection name", "objects": "list of object names"},
+    },
+    "world": {
+        "summary": "Set the world background colour and strength",
+        "args": {"color": "RGB [0..1]", "strength": "0..100, default 1"},
+    },
+    "lighting": {
+        "summary": "Add a ready-made light rig aimed at a point",
+        "args": {
+            "prefix": "unique name prefix for the lights",
+            "preset": "three_point|sun, default three_point",
+            "target": "aim point [x,y,z], default [0,0,0]",
+            "distance": "0.1..1000 from the target, default 6",
+            "energy": "key light 0..10000, default 800 (sun: 3)",
+        },
+    },
     "render": {
         "summary": "Render still or animation using current scene settings and resolution; blocking",
         "args": {"filename": "simple output filename/prefix", "animation": "boolean default false"},
@@ -68,24 +93,39 @@ OPERATIONS = {
 
 
 def validate(op, s):
+    from .engine import name, number, vector
+
     if op not in OPERATIONS:
         return False
     required = {
-        "python": ("code",),
+        "python": (),
         "modifier": ("name", "modifier"),
         "keyframes": ("name", "data_path", "keys"),
         "frame": (),
         "properties": ("values",),
         "rna": ("type",),
         "render": ("filename",),
+        "parent": ("name",),
+        "collection": ("name", "objects"),
+        "world": ("color",),
+        "lighting": ("prefix",),
     }
     for key in required[op]:
         if key not in s:
             raise ValueError(f"{op} needs {key}")
     if op == "python":
-        if not isinstance(s["code"], str):
+        if ("code" in s) == ("file" in s):
+            raise ValueError("python needs code or file, not both")
+        if "file" in s:
+            path = s["file"]
+            if not isinstance(path, str) or not path.endswith(".py") or not os.path.isabs(path):
+                raise ValueError("file must be an absolute path to a .py file")
+            if not os.path.isfile(path):
+                raise ValueError(f"No such file: {path}")
+        elif not isinstance(s["code"], str):
             raise ValueError("code must be a string")
-        compile(s["code"], "<frugal-mcp>", "exec")
+        else:
+            compile(s["code"], "<frugal-mcp>", "exec")
         if not isinstance(s.get("params", {}), dict):
             raise ValueError("params must be an object")
         if type(s.get("max_output", 2000)) is not int or not 0 <= s.get("max_output", 2000) <= 32000:
@@ -117,20 +157,44 @@ def validate(op, s):
             raise ValueError("limit must be 1..100")
         if type(s.get("offset", 0)) is not int or s.get("offset", 0) < 0:
             raise ValueError("offset must be nonnegative")
+    if op == "parent" and "parent" in s:
+        name(s["parent"])
+    if op == "collection":
+        name(s["name"])
+        if not isinstance(s["objects"], list) or not 1 <= len(s["objects"]) <= 200:
+            raise ValueError("objects must contain 1..200 names")
+        for value in s["objects"]:
+            name(value)
+    if op == "world":
+        for value in vector(s["color"]):
+            number(value, 0, 1)
+        number(s.get("strength", 1), 0, 100)
+    if op == "lighting":
+        name(s["prefix"])
+        if s.get("preset", "three_point") not in ("three_point", "sun"):
+            raise ValueError("preset must be three_point or sun")
+        vector(s.get("target", [0, 0, 0]))
+        number(s.get("distance", 6), 0.1, 1000)
+        number(s.get("energy", 800), 0, 10000)
     if op == "render" and type(s.get("animation", False)) is not bool:
         raise ValueError("animation must be boolean")
     return True
+
+
+TAIL = 600  # printed output kept for a failed python step's error
 
 
 class BoundedOutput(io.TextIOBase):
     def __init__(self, limit):
         self.limit = limit
         self.text = ""
+        self.tail = ""
         self.total = 0
 
     def write(self, text):
         self.total += len(text)
         self.text += text[: max(0, self.limit - len(self.text))]
+        self.tail = (self.tail + text)[-TAIL:]
         return len(text)
 
 
@@ -144,7 +208,7 @@ def set_path(target, path, value):
 
 
 def run(engine, s):
-    from .engine import owned, output_file
+    from .engine import OWNER, owned, output_file
 
     op = s["op"]
     if op not in OPERATIONS:
@@ -152,9 +216,23 @@ def run(engine, s):
     if op == "python":
         limit = s.get("max_output", 2000)
         capture = BoundedOutput(limit)
-        namespace = {"bpy": bpy, "params": s.get("params", {}), "output_dir": str(engine.output_dir)}
-        with contextlib.redirect_stdout(capture), contextlib.redirect_stderr(capture):
-            exec(compile(s["code"], "<frugal-mcp>", "exec"), namespace)
+        # One namespace for the bridge's life, so a later call can reuse what an earlier one set up.
+        namespace = engine.namespace
+        namespace.pop("result", None)
+        namespace.update(bpy=bpy, params=s.get("params", {}), output_dir=str(engine.output_dir))
+        if "file" in s:
+            with open(s["file"], encoding="utf-8") as source:
+                code = compile(source.read(), s["file"], "exec")
+            namespace["__file__"] = s["file"]
+        else:
+            code = compile(s["code"], "<frugal-mcp>", "exec")
+        try:
+            with contextlib.redirect_stdout(capture), contextlib.redirect_stderr(capture):
+                exec(code, namespace)
+        except Exception as exc:
+            if capture.tail.strip():
+                raise RuntimeError(f"{exc}\nLast output:\n{capture.tail.strip()}") from exc
+            raise
         value = namespace.get("result")
         # Reject non-JSON results explicitly, rather than leaking opaque bpy representations.
         encoded = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
@@ -166,7 +244,8 @@ def run(engine, s):
                 )
             else:
                 response["value"] = value
-        if capture.total:
+        # Importers print a lot; with a result set, the printed output is only noise.
+        if capture.total and "result" not in namespace:
             response.update(stdout=capture.text, stdout_truncated=capture.total > limit)
         # Python may mutate anything; never invent an object-change count.
         return {"result": response}
@@ -203,6 +282,66 @@ def run(engine, s):
                 if not target.keyframe_insert(data_path=path, frame=frame, index=index):
                     raise RuntimeError("Blender rejected keyframe insertion")
         return {"changed": 1}
+    if op == "parent":
+        child = owned(s["name"])
+        world = child.matrix_world.copy()
+        if s.get("parent"):
+            parent = owned(s["parent"])
+            child.parent = parent
+            child.matrix_parent_inverse = parent.matrix_world.inverted()
+        else:
+            child.parent = None
+            child.matrix_world = world
+        return {"changed": 1}
+    if op == "collection":
+        group = bpy.data.collections.get(s["name"])
+        if group is None:
+            group = bpy.data.collections.new(s["name"])
+            group[OWNER] = True
+            bpy.context.scene.collection.children.link(group)
+        elif group.get(OWNER) is not True:
+            raise ValueError("A collection with that name exists and was not made by this add-on")
+        objects = [owned(n) for n in dict.fromkeys(s["objects"])]
+        for obj in objects:
+            for other in list(obj.users_collection):
+                other.objects.unlink(obj)
+            group.objects.link(obj)
+        return {"changed": len(objects)}
+    if op == "world":
+        scene = bpy.context.scene
+        scene.world = scene.world or bpy.data.worlds.new("World")
+        scene.world.use_nodes = True
+        node = next(n for n in scene.world.node_tree.nodes if n.type == "BACKGROUND")
+        node.inputs["Color"].default_value = (*s["color"], 1)
+        node.inputs["Strength"].default_value = s.get("strength", 1)
+        return {"changed": 1}
+    if op == "lighting":
+        target = s.get("target", [0, 0, 0])
+        reach = s.get("distance", 6) / 1.5
+        if s.get("preset", "three_point") == "sun":
+            rig = [("sun", "SUN", (0.5, -0.5, 1.0), s.get("energy", 3))]
+        else:
+            key = s.get("energy", 800)
+            rig = [
+                ("key", "AREA", (0.8, -1.0, 0.8), key),
+                ("fill", "AREA", (-1.0, -0.8, 0.3), key * 0.4),
+                ("rim", "AREA", (0.2, 1.0, 0.9), key * 0.6),
+            ]
+        for label, *_ in rig:
+            if f"{s['prefix']}_{label}" in bpy.data.objects:
+                raise ValueError(f"Object already exists: {s['prefix']}_{label}")
+        for label, kind, side, energy in rig:
+            engine.step(
+                {
+                    "op": "light",
+                    "name": f"{s['prefix']}_{label}",
+                    "kind": kind,
+                    "energy": energy,
+                    "location": [t + o * reach for t, o in zip(target, side, strict=True)],
+                    "target": target,
+                }
+            )
+        return {"changed": len(rig)}
     if op == "frame":
         scene = bpy.context.scene
         for key, attr in (("start", "frame_start"), ("end", "frame_end")):

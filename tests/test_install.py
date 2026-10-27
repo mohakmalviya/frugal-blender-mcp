@@ -38,3 +38,15 @@ def test_zip_contains_only_addon_sources(tmp_path):
         names = archive.namelist()
     assert "compact_blender/__init__.py" in names
     assert all(name.startswith("compact_blender/") and name.endswith(".py") for name in names)
+
+
+def test_extension_zip_has_the_manifest_at_its_root_and_matches_the_package_version(tmp_path):
+    import tomllib
+
+    from compact_mcp import __version__
+
+    with ZipFile(install.write_extension_zip(tmp_path / "ext.zip")) as archive:
+        names = archive.namelist()
+        manifest = tomllib.loads(archive.read("blender_manifest.toml").decode())
+    assert "__init__.py" in names and all("/" not in name for name in names)
+    assert manifest["version"] == __version__ and manifest["id"] == "compact_blender"

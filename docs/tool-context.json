@@ -13,16 +13,16 @@
       "capture"
     ],
     "definition_tokens": {
-      "o200k_base": 289,
-      "cl100k_base": 280
+      "o200k_base": 261,
+      "cl100k_base": 252
     },
     "instruction_tokens": {
-      "o200k_base": 49,
-      "cl100k_base": 50
+      "o200k_base": 36,
+      "cl100k_base": 37
     },
     "total_tokens": {
-      "o200k_base": 338,
-      "cl100k_base": 330
+      "o200k_base": 297,
+      "cl100k_base": 289
     }
   },
   {
